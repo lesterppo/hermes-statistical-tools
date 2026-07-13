@@ -26,11 +26,18 @@ echo "Installing dependencies..."
 # StatsModels: statsmodels, pandas
 # SEM: semopy
 # IRT: girth
-$PIP "numpy>=1.26,<2" "scipy>=1.12,<2" 2>&1 | tail -1
-$PIP "pandas>=2.0,<3" 2>&1 | tail -1
-$PIP "statsmodels>=0.14,<1" 2>&1 | tail -1
-$PIP "semopy>=2.3,<3" 2>&1 | tail -1
-$PIP "girth>=0.8,<1" 2>&1 | tail -1
+# Medical_Ext: lifelines (survival) + statsmodels (power); meta is pure numpy/scipy
+# All versions live in requirements.txt (single source of truth).
+if [ -f requirements.txt ]; then
+    $PIP -r requirements.txt 2>&1 | tail -3
+else
+    $PIP "numpy>=1.26,<2" "scipy>=1.12,<2" 2>&1 | tail -1
+    $PIP "pandas>=2.0,<3" 2>&1 | tail -1
+    $PIP "statsmodels>=0.14,<1" 2>&1 | tail -1
+    $PIP "semopy>=2.3,<3" 2>&1 | tail -1
+    $PIP "girth>=0.8,<1" 2>&1 | tail -1
+    $PIP "lifelines>=0.29,<1" 2>&1 | tail -1
+fi
 
 echo ""
 echo "=== Verifying ==="
@@ -48,4 +55,4 @@ echo "=== Setup Complete ==="
 echo "Copy tools/*.py to your Hermes checkout:"
 echo "  cp tools/*.py ~/.hermes/hermes-agent/tools/"
 echo "Then add to toolsets.py medical toolset:"
-echo "  'medical': {'tools': ['pspp','statsmodels','sem','irt'], ...}"
+echo "  'medical': {'tools': ['pspp','statsmodels','sem','irt','medical_ext'], ...}"

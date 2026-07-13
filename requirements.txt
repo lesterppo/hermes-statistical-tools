@@ -1,0 +1,25 @@
+# Pinned dependencies for the Hermes Statistical Tools suite.
+# Use `pip install -r requirements.txt` inside your Hermes venv.
+# Upper bounds follow the hermes-agent dependency policy (supply-chain safety).
+
+# Core (all tools)
+numpy>=1.24,<3
+scipy>=1.10,<2
+
+# PSPP tool (pure-Python PSPP 2.0.0 command set)
+# no extra deps
+
+# StatsModels tool
+statsmodels>=0.14,<1
+
+# SEM tool
+semopy>=2.3,<3
+
+# IRT tool
+girth>=0.8,<1
+
+# Medical Extended tool
+# - survival: lifelines
+# - power: statsmodels (already pinned above)
+# - meta: pure numpy/scipy (statsmodels 0.15+ native combine_effects used when available)
+lifelines>=0.29,<1

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.venv/
+venv/
+env/
+
+# Secrets (never commit)
+.env
+*.env
+secrets.json
+credentials.json
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local scratch
+*.log
+tmp/
