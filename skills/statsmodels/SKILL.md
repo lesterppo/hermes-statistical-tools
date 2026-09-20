@@ -1,7 +1,7 @@
 ---
 name: statsmodels-tool
 description: Build, test, and extend the agent-native statsmodels statistical tool.
-version: 1.0.0
+version: 1.1.0
 author: Peter (lesterppo)
 license: MIT
 tags: [statsmodels, statistics, medical, tools, agent-native]
@@ -25,7 +25,8 @@ and MICE with pooled analysis (Rubin's Rules).
 statsmodels(action="mlm",      d="CSV", o="y", p=["x1","x2"], g="subject")
 statsmodels(action="gee",      d="CSV", o="y", p=["x1"],      g="id", fam="binomial", cov="exchangeable")
 statsmodels(action="gee_ord",  d="CSV", o="y", p=["x1"],      g="id", cov="exchangeable")
-statsmodels(action="anova_rm", d="CSV", o="y", g="subject",   w=["time"], b=["group"])
+statsmodels(action="gee_nom",  d="CSV", o="y", p=["x1"],      g="id")
+statsmodels(action="anova_rm", d="CSV", o="y", g="subject",   w=["time"])
 statsmodels(action="mice",     d="CSV", o="y", p=["x1","x2"], n=10, mod="ols")
 ```
 
@@ -36,8 +37,8 @@ statsmodels(action="mice",     d="CSV", o="y", p=["x1","x2"], n=10, mod="ols")
 | `mlm` | `sm.MixedLM` | Linear mixed models (random intercepts) |
 | `gee` | `sm.GEE` | Generalized Estimating Equations |
 | `gee_ord` | `sm.OrdinalGEE` | Ordinal GEE (ordered categorical) |
-| `gee_nom` | `sm.NominalGEE` | Nominal GEE (experimental) |
-| `anova_rm` | `AnovaRM` | Repeated measures ANOVA |
+| `gee_nom` | `sm.NominalGEE` | Nominal GEE (experimental — falls back gracefully) |
+| `anova_rm` | `AnovaRM` | Repeated measures ANOVA (within-subject only) |
 | `mice` | `MICE` | Multiple imputation + pooled analysis |
 
 ### GEE Families
@@ -76,10 +77,11 @@ Compact JSON with short keys:
 ## Pitfalls
 
 - **NominalGEE is experimental** in statsmodels 0.14.6 — may raise
-  NotImplementedError. Fall back to `gee_ord` or binary-encoded `gee`.
-- **AnovaRM does NOT support between-subject factors** — `b` parameter
-  was removed. For mixed between-within designs, use the `mlm` action.
-- **AnovaRM within-only**: requires at least one within-subject factor.
+  NotImplementedError. The tool catches it with an actionable message;
+  fall back to `gee_ord` or binary-encoded `gee`.
+- **AnovaRM does NOT support between-subject factors** — there is no `b`
+  param on `statsmodels_run`. For mixed between-within designs, use `mlm`.
+- **AnovaRM within-only**: requires at least one within-subject factor `w`.
 - **Intercept-only models**: pass `p=[]` for null models — tool
   auto-creates constant-only design matrix.
 - **Small datasets** (< 10 observations) cause SVD convergence failures in
@@ -112,8 +114,10 @@ print('OK')
 "
 ```
 
+Or from the repo: `python3 -m pytest tests/ -q` (42 tests, must stay green).
+
 ## File Location
 
-`tools/statsmodels_tool.py` — 818 lines, 6 actions, registry-registered as
+`tools/statsmodels_tool.py` — 6 actions, registry-registered as
 `"statsmodels"` in `"medical"` toolset. Requires statsmodels >= 0.14 and
 pandas.

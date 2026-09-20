@@ -1,0 +1,14 @@
+name: hermes_statistical_tools
+description: >-
+  Native, token-efficient statistical analysis tools for Hermes Agent — pure
+  Python PSPP 2.0.0 command set (45 test types), statsmodels advanced models
+  (mixed models, GEE, RM-ANOVA, MICE), SEM via semopy, IRT via girth, and
+  headless medical statistics (survival KM/Cox/log-rank, meta-analysis,
+  power/sample-size). Registers the medical toolset: pspp, statsmodels, sem,
+  irt, medical_ext.
+author: Peter (lesterppo)
+version: 1.0.0
+license: MIT
+kind: standalone
+tags: [statistics, pspp, statsmodels, sem, irt, survival, meta-analysis, power, scipy, semopy, girth, lifelines, medical, hermes-agent, ai-agent]
+homepage: https://github.com/lesterppo/hermes-statistical-tools

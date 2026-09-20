@@ -24,7 +24,40 @@ cd hermes-statistical-tools
 bash install.sh
 ```
 
-## Deploy into Hermes
+## Deploy into Hermes (Plugin — recommended)
+
+`./install.sh` (no flags) installs the tools as the `hermes_statistical_tools`
+plugin under `~/.hermes/plugins/`, **outside** the Hermes git tree, so
+`hermes update` cannot wipe them:
+
+```bash
+bash install.sh              # deps + plugin install/refresh (DEFAULT)
+bash install.sh --check      # backend availability only
+bash install.sh --legacy     # copy into hermes-agent/tools/ (update-lossy)
+bash install.sh --uninstall  # remove the plugin
+```
+
+Then enable + verify:
+
+```bash
+hermes plugins enable hermes_statistical_tools   # if not auto-enabled
+# restart Hermes (or the gateway) so the plugin loads
+hermes tools list | grep -E 'pspp|statsmodels|sem|irt|medical_ext'
+```
+
+The plugin registers the `medical` toolset
+(`pspp`, `statsmodels`, `sem`, `irt`, `medical_ext`) via two-step
+registration — each tool module self-registers on import, then
+`register(ctx)` marks them plugin-owned. No core Hermes files are modified.
+See `plugin/__init__.py` for the pattern.
+
+> **Overlap warning:** the sibling [`hermes-medical-tools`](https://github.com/lesterppo/hermes-medical-tools)
+> plugin registers the same `medical` toolset (including its own `pspp`).
+> Enabling both registers those names twice — last registration wins. The
+> installer flags the collision; disable one set
+> (`hermes plugins disable <name>`) if results look off.
+
+### Legacy git-tree install (breaks on next update)
 
 ```bash
 cp tools/*.py <hermes-agent>/tools/

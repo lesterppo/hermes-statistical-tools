@@ -1,71 +1,109 @@
 ---
-name: sem-irt-tools
-description: Build, test, and extend the SEM and IRT Hermes tools.
-version: 1.0.0
+name: irt-tool
+description: Build, test, and extend the agent-native IRT Hermes tool.
+version: 1.1.0
 author: Peter (lesterppo)
 license: MIT
-tags: [sem, irt, semopy, girth, statistics, medical, agent-native]
+tags: [irt, girth, statistics, medical, agent-native]
 ---
 
-# SEM + IRT Tools — Agent-Native SEM and IRT
+# IRT Tool — Agent-Native Item Response Theory
 
-Two tools wrapping semopy 2.3.11 (SEM) and girth 0.8.0 (IRT). Together with
-PSPP (45 types) and statsmodels (6 types), these complete the Hermes statistical
-analysis suite: descriptive → mixed models → SEM → IRT.
+Wraps girth 0.8.0: Rasch/1PL, 2PL, 3PL, GRM/PCM for polytomous data, ability
+scoring, and CTT statistics. Together with PSPP, statsmodels, and SEM, it
+completes the Hermes statistical suite.
 
-## SEM Tool (sem_tool.py, 362 lines)
+## When to Use
 
-Actions: `sem_fit`, `sem_inspect`
+- Fitting IRT models or scoring respondents in Hermes
+- Debugging girth orientation / naming / optimizer issues
+- Extending scoring (new estimators, SE methods)
 
-Model syntax (lavaan-like):
+## Quick Reference
+
 ```
-f1 =~ x1 + x2 + x3    # latent factor defined by indicators
-f2 ~ f1                # structural regression
-x1 ~~ x1               # variance
+irt(action="irt_rasch", d="CSV", method="jml")                 # or method="mml"
+irt(action="irt_2pl",   d="CSV")
+irt(action="irt_3pl",   d="CSV")
+irt(action="irt_grm",   d="CSV")                               # polytomous 0,1,2,...
+irt(action="irt_pcm",   d="CSV")
+irt(action="irt_score", d="CSV", diff="-1.5,0.3,1.2", disc="1.0,1.2,0.8", model="2pl")
+irt(action="irt_score", d="CSV", diff="...", disc="...", guess="0.2,0.15,0.25", model="3pl")
+irt(action="irt_ctt",   d="CSV")
 ```
 
-Output: parameter estimates (lval/op/rval/c/s/z/p) + fit indices (CFI, RMSEA, GFI, AIC, BIC, chi2).
+Caller data layout is **always rows = people, cols = items**. Binary items:
+0/1 (1/2 auto-converted). Polytomous: 0,1,2,… ordered categories.
 
-### Pitfalls
-- `inspect(std_est=True)` not `mode='std_est'` — actual semopy API
-- Cached per-session: `sem_inspect` only works after `sem_fit` in same session
-- Fixed parameters (first loading) have `'-'` for SE/z-value — handled gracefully
-- calc_stats returns DataFrame; fit indices extracted via `.iloc[0]`
+## Orientation (post-fix)
 
-## IRT Tool (irt_tool.py, 550 lines)
+**Every** girth estimator and ability function expects items × people.
+The tool centralizes this in `_to_girth()` (transpose people×items →
+items×people) — no call site transposes by hand. Passing people×items
+directly to girth silently swaps items for respondents (item estimates come
+back person-length), which is why the old code produced garbage lengths.
 
-Actions: `irt_rasch`, `irt_2pl`, `irt_3pl`, `irt_grm`, `irt_pcm`, `irt_score`, `irt_ctt`
+## girth Result Naming (post-fix, verified on girth 0.8.0)
 
-### girth Naming Quirk
-girth MML output swaps field names:
-- `"Difficulty"` → person ability (theta)
-- `"Ability"` → item difficulty (beta)
-- Our `_build_model_out` remaps correctly
+- `"Difficulty"` → **item** difficulties (n_items; 2D thresholds for GRM/PCM)
+- `"Discrimination"` → **item** discriminations (n_items; scalar broadcast
+  for Rasch/1PL fixed-discrimination output)
+- `"Guessing"` → item guessing, 3PL only (n_items)
+- `"Ability"` → **person** abilities (n_people)
 
-### Orientation
-- Model fitting: data as (n_people, n_items) — girth accepts both orientations
-- Scoring: data MUST be transposed to (n_items, n_people)
-- Binary data: auto-converted 1/2 → 0/1
+The earlier "swapped names" theory was wrong — it was the orientation bug.
+`_build_model_out` maps these canonically.
 
-### 3PL Limitations
-girth 0.8.0 threepl_mml has a scipy optimizer bug that crashes on many
-datasets. Tool catches this gracefully with an actionable error message
-suggesting irt_2pl or more data.
+## Length Validation (post-fix)
+
+Every vector is validated against the data shape before reporting:
+
+- `diff`/`disc`/`g` must be item-length, `a` (ability) person-length
+- Mismatches are **omitted** with `warn_d` / `warn_disc` / `warn_a` flags —
+  a person-length vector is never reported as an item parameter or vice versa
+- `irt_score` rejects `diff`/`disc`/`guess` whose length ≠ n_items with an error
+- GRM/PCM do listwise deletion of missing rows (`.astype(int)` on NaN raises,
+  so NaN rows are dropped first — same as the binary path)
+
+## 3PL: Shim + Native Scorer (post-fix)
+
+- girth 0.8.0's `threepl_mml` crashes on scipy ≥ 1.14 (size-1 array through
+  `fminbound`). `_apply_scipy_compat_shim()` wraps the module-level
+  `fminbound` to squeeze scalar outputs — 3PL fitting works instead of
+  erroring. If the shim ever fails, the graceful error path (suggest
+  `irt_2pl` / more data) still applies.
+- girth 0.8.0's `ability_eap/mle/map` take **no guessing parameter**, so
+  3PL scoring (`model="3pl"` + nonzero `guess`) uses the native
+  `_score_3pl_mle`: per-respondent bounded MLE under the 3PL ICC with SE
+  from observed information. Output `method` reads `"mle-3pl"` with an `se`
+  array; perfect/zero scores clip to ±6 (MLE is ±infinity there).
+- Scoring `method` accepts `mle`/`eap`/`map`; estimation-only values
+  (`jml`/`mml`) fall back to `mle` instead of erroring.
+
+## Pitfalls
+
+- Binary data auto-converts 1/2 → 0/1; anything else non-0/1 is rejected
+- `irt_run` signature is `(action, d, method, diff, disc, guess, model)` —
+  the registry handler must mirror all seven
+- GRM/PCM need genuine polytomous (multi-category) input
+- Small samples make MML estimates unstable — prefer `irt_rasch`/`irt_2pl`
 
 ## Verification
+
 ```bash
 python3 -c "
-from tools.sem_tool import sem_run, _check_sem
 from tools.irt_tool import irt_run, _check_irt
-assert _check_sem() and _check_irt()
+assert _check_irt()
 print('OK')
 "
 ```
 
+Or from the repo: `python3 -m pytest tests/ -q` (42 tests, must stay green).
+
 ## Dependencies
-- semopy>=2.3,<3
+
 - girth>=0.8,<1
 
-## File Locations
-- `tools/sem_tool.py` — registry: `sem` in `medical` toolset
+## File Location
+
 - `tools/irt_tool.py` — registry: `irt` in `medical` toolset
