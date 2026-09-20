@@ -87,21 +87,37 @@ def _unique_groups(cols: dict, a: str) -> list:
 
 
 def _rnd(val, ndigits=4):
-    if val is None or (isinstance(val, float) and math.isnan(val)):
+    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+        return None
+    if isinstance(val, (np.floating, np.integer)):
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return round(f, ndigits)
+    try:
+        f = float(val)
+    except (ValueError, TypeError):
+        return None
+    if math.isnan(f) or math.isinf(f):
         return None
     try:
-        return round(float(val), ndigits)
-    except (ValueError, TypeError):
+        return round(f, ndigits)
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
 def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
+    """Signed Cohen's d = (mean(b) - mean(a)) / pooled SD.
+
+    Sign convention: positive means group b (g2) scores higher than
+    group a (g1). Callers pass groups in user-supplied g order.
+    """
     n1, n2 = len(a), len(b)
     if n1 < 2 or n2 < 2:
         return 0.0
     sd1, sd2 = float(np.std(a, ddof=1)), float(np.std(b, ddof=1))
     pooled = math.sqrt(((n1 - 1) * sd1 ** 2 + (n2 - 1) * sd2 ** 2) / (n1 + n2 - 2))
-    return round(float(abs(np.mean(b) - np.mean(a)) / pooled), 4) if pooled > 0 else 0.0
+    return round(float((np.mean(b) - np.mean(a)) / pooled), 4) if pooled > 0 else 0.0
 
 
 def _design_matrix(X_cols: List[np.ndarray], add_intercept: bool = True) -> np.ndarray:
@@ -403,7 +419,8 @@ def _do_pttest(cols: dict, args: dict) -> dict:
         return {"e": "Need ≥3 pairs"}
     t, p = scipy_stats.ttest_rel(x1[:n], x2[:n])
     diff = x1[:n] - x2[:n]
-    d = float(abs(np.mean(diff)) / np.std(diff, ddof=1)) if np.std(diff, ddof=1) > 0 else 0.0
+    sd_diff = float(np.std(diff, ddof=1)) if n > 1 else 0.0
+    d = float(np.mean(diff) / sd_diff) if sd_diff > 0 else 0.0
     return {
         "n": n, "m1": _rnd(float(np.mean(x1[:n]))), "m2": _rnd(float(np.mean(x2[:n]))),
         "t": _rnd(t), "df": n - 1, "p": _rnd(p), "d": _rnd(d),
@@ -457,21 +474,28 @@ def _do_anova(cols: dict, args: dict) -> dict:
 
 
 def _do_posthoc(groups: List[np.ndarray], labels: list, method: str) -> list:
-    """Pairwise post-hoc comparisons."""
+    """Pairwise post-hoc comparisons.
+
+    tukey:      Tukey HSD (equal variances), already family-wise corrected.
+    bonferroni: Tukey-style t pairwise + Bonferroni correction.
+    gh:         Games-Howell (unequal variances, Welch SE + Studentized Range).
+                Already family-wise corrected — NO further adjustment applied.
+    """
     pairs = []
     raw_p = []
     for i in range(len(groups)):
         for j in range(i + 1, len(groups)):
             md = float(np.mean(groups[j]) - np.mean(groups[i]))
             if method == "gh":
-                # Games-Howell: Welch's SE + Studentized Range distribution
+                # Games-Howell: t = |md| / sqrt(v1/n1 + v2/n2) (Welch SE),
+                # p from the Studentized Range distribution with q = t*sqrt(2)
+                # and Welch-Satterthwaite df. Already corrected.
                 n1, n2 = len(groups[i]), len(groups[j])
                 v1, v2 = float(np.var(groups[i], ddof=1)), float(np.var(groups[j], ddof=1))
-                se = math.sqrt(v1 / n1 + v2 / n2)
-                df = (v1 / n1 + v2 / n2) ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
-                se_gh = math.sqrt((v1 / n1 + v2 / n2) / 2)  # scale for q distribution
-                q_val = abs(md) / se_gh if se_gh > 0 else 0
-                p_val = float(scipy_stats.studentized_range.sf(q_val * math.sqrt(2), len(groups), df))
+                S = v1 / n1 + v2 / n2
+                t_gh = abs(md) / math.sqrt(S) if S > 0 else 0
+                df = S ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1)) if S > 0 else 1
+                p_val = float(scipy_stats.studentized_range.sf(t_gh * math.sqrt(2), len(groups), df))
             else:
                 # Tukey HSD
                 mse = sum(float(np.sum((g - np.mean(g)) ** 2)) for g in groups) / (sum(len(g) for g in groups) - len(groups))
@@ -484,10 +508,8 @@ def _do_posthoc(groups: List[np.ndarray], labels: list, method: str) -> list:
     # Adjust p-values
     if method == "bonferroni":
         adj = _p_adjust(raw_p, "bonferroni")
-    elif method == "gh":
-        adj = _p_adjust(raw_p, "bonferroni")
     else:
-        adj = raw_p  # Tukey is already corrected
+        adj = raw_p  # Tukey and Games-Howell are already family-wise corrected
     for idx in range(len(pairs)):
         pairs[idx]["p"] = _rnd(adj[idx])
     return pairs
@@ -690,11 +712,13 @@ def _do_partial_corr(cols: dict, args: dict) -> dict:
                 pcorr[i, j] = val
     # Extract pairwise partial correlations among target variables
     pairs = []
+    # df for the t-test of a partial r controlling k covariates:
+    # df = n - 2 - k = n - len(all_vars) (2 targets + k controls).
+    df = n - len(all_vars)
     for i in range(len(variables)):
         for j in range(i + 1, len(variables)):
             r_partial = float(pcorr[i, j])
             # t-test for partial correlation
-            df = n - len(all_vars) - 1
             if df > 0 and abs(r_partial) < 1:
                 t_val = r_partial * math.sqrt(df / (1 - r_partial ** 2))
                 p_val = float(2 * scipy_stats.t.sf(abs(t_val), df))
@@ -702,7 +726,7 @@ def _do_partial_corr(cols: dict, args: dict) -> dict:
                 p_val = None
             pairs.append({"v": f"{variables[i]}-{variables[j]}", "r": _rnd(r_partial), "p": _rnd(p_val),
                          "control": controls})
-    return {"pairs": pairs, "df": n - len(all_vars) - 1}
+    return {"pairs": pairs, "df": df}
 
 
 # ─── REGRESSION ───────────────────────────────────────────────────
@@ -793,6 +817,7 @@ def _do_logistic(cols: dict, args: dict) -> dict:
     X = _design_matrix([x[:n] for x in X_cols], add_intercept=True)
     # IRLS / Newton-Raphson
     beta = np.zeros(X.shape[1])
+    converged = False
     for _ in range(50):
         eta = X @ beta
         eta = np.clip(eta, -30, 30)
@@ -807,6 +832,7 @@ def _do_logistic(cols: dict, args: dict) -> dict:
             return {"e": "Matrix singular — predictors may be collinear or complete separation"}
         if np.max(np.abs(beta_new - beta)) < 1e-6:
             beta = beta_new
+            converged = True
             break
         beta = beta_new
     # Standard errors
@@ -838,10 +864,24 @@ def _do_logistic(cols: dict, args: dict) -> dict:
                 "z": _rnd(z_vals[i]), "p": _rnd(p_vals[i]),
                 "OR": _rnd(math.exp(beta[i])),
             })
-    return {
+    result = {
         "n": n, "R2_mcfadden": _rnd(mcfadden_R2),
         "coef": coefs,
     }
+    # Separation diagnostics: non-convergence, huge |B|/SE, or perfect
+    # in-sample classification all signal complete/quasi-complete separation.
+    pred_pos = (mu >= 0.5).astype(float)
+    perfect = bool(np.all(pred_pos == y)) if n > 0 else False
+    max_se = float(np.nanmax(se)) if len(se) else 0.0
+    if (not converged) or perfect or max_se > 100 or np.max(np.abs(beta)) > 10:
+        result["warn_separation"] = (
+            "possible complete/quasi-complete separation"
+            f" (converged={converged}, perfect_classification={perfect},"
+            f" max|B|={float(np.max(np.abs(beta))):.2f}, maxSE={max_se:.2f}):"
+            " coefficients/SEs may be inflated; consider Firth penalized"
+            " logistic regression or collapsing sparse categories"
+        )
+    return result
 
 
 # ─── ADVANCED ─────────────────────────────────────────────────────
@@ -1860,6 +1900,9 @@ def _do_pscore(cols: dict, args: dict) -> dict:
         "ps_mean_control": _rnd(float(np.mean(ps[treat < 0.5]))),
         "smd_before": dict(zip(predictors, smd_before)),
         "smd_after": dict(zip(predictors, smd_after)),
+        "note": ("smd_after uses ATE (inverse-probability) weights for the average "
+                 "treatment effect in the whole sample. For the ATT (effect on the "
+                 "treated), reweight controls by ps/(1-ps) with treated weight 1."),
     }
 
 
@@ -2069,7 +2112,8 @@ def _do_beta(cols: dict, args: dict) -> dict:
     X_cols = [_arr(cols[pv]) for pv in predictors]
     n = min(len(y), *(len(x) for x in X_cols))
     y, X = y[:n], _design_matrix([x[:n] for x in X_cols], add_intercept=True)
-    # Clip to (0.001, 0.999) to avoid log(0)
+    # Beta regression requires y in (0,1): clip boundary values and note it.
+    n_clip = int(np.sum((y <= 0) | (y >= 1)))
     y = np.clip(y, 0.001, 0.999)
     k = X.shape[1]
     # Transform: logit link
@@ -2110,13 +2154,26 @@ def _do_beta(cols: dict, args: dict) -> dict:
     ll_full = float(np.sum(y * np.log(mu) + (1 - y) * np.log(1 - mu)))
     ll_null = float(np.sum(y * np.log(np.mean(y)) + (1 - y) * np.log(1 - np.mean(y))))
     mcfadden = 1 - ll_full / ll_null if ll_null != 0 else 0
-    return {"n": n, "R2_mcfadden": _rnd(mcfadden), "coef": coefs}
+    out = {"n": n, "R2_mcfadden": _rnd(mcfadden), "coef": coefs,
+           "note": "logit link: exp(B) = odds ratio for mean proportion mu/(1-mu). "
+                   "Quasi-MLE via IRLS (no precision submodel); SEs are approximate."}
+    if n_clip:
+        out["warn_clip"] = (
+            f"{n_clip}/{n} outcomes on the [0,1] boundary were clipped to "
+            "(0.001,0.999). Beta regression requires y in (0,1); consider "
+            "zero/one-inflated beta regression if boundary mass is substantial."
+        )
+    return out
 
 
 # ─── HEDGES' G + MCDONALD'S OMEGA ────────────────────────────────
 
 def _do_hedgesg(cols: dict, args: dict) -> dict:
-    """Hedges' g (bias-corrected Cohen's d) from data or direct value."""
+    """Hedges' g (bias-corrected Cohen's d) from data or direct value.
+
+    Signed: positive means g[1] (second group label) scores higher than
+    g[0]. Magnitude-only consumers should take abs(g).
+    """
     a, v, g = args.get("a", ""), args.get("v", ""), args.get("g", [])
     if a and v and len(g) >= 2 and a in cols and v in cols:
         grps = _groups(cols[v], cols[a], g[:2])
@@ -2125,18 +2182,24 @@ def _do_hedgesg(cols: dict, args: dict) -> dict:
             return {"e": "Need ≥2 per group"}
         sd1, sd2 = float(np.std(grps[0], ddof=1)), float(np.std(grps[1], ddof=1))
         pooled = math.sqrt(((n1-1)*sd1**2 + (n2-1)*sd2**2) / (n1+n2-2))
-        d = abs(float(np.mean(grps[1])) - float(np.mean(grps[0]))) / pooled if pooled > 0 else 0
+        d = float(np.mean(grps[1]) - float(np.mean(grps[0]))) / pooled if pooled > 0 else 0
         # Hedges' g correction
         df = n1 + n2 - 2
         J = 1 - 3 / (4 * df - 1) if df > 2 else 1
         g_val = d * J
         se_g = math.sqrt((n1+n2)/(n1*n2) + g_val**2/(2*(n1+n2)))
-        return {"d": _rnd(d), "g": _rnd(g_val), "se": _rnd(se_g), "n1": n1, "n2": n2}
+        return {"d": _rnd(d), "g": _rnd(g_val), "se": _rnd(se_g), "n1": n1, "n2": n2,
+                "direction": f"{g[1]} minus {g[0]} (positive = {g[1]} higher)"}
     return {"e": "a (group var), v (value var), g=[g1,g2] required"}
 
 
 def _do_omega(cols: dict, args: dict) -> dict:
-    """McDonald's omega (hierarchical) — doesn't assume tau-equivalence."""
+    """McDonald's omega (hierarchical) — doesn't assume tau-equivalence.
+
+    Single-factor approximation: assumes the items are unidimensional
+    (one dominant factor). Verify with the 'factor' action first; if the
+    scale is multidimensional, omega_hierarchical here is optimistic.
+    """
     variables = args.get("v", [])
     if not variables or len(variables) < 2:
         return {"e": "v (2+ item variables) required"}
@@ -2161,7 +2224,8 @@ def _do_omega(cols: dict, args: dict) -> dict:
     total_var = float(np.var(total_scores, ddof=1))
     k = len(variables)
     alpha = (k / (k - 1)) * (1 - float(np.sum(item_vars)) / total_var) if total_var > 0 and k > 1 else 0
-    return {"omega": _rnd(omega_val), "alpha": _rnd(alpha), "loadings": {v: _rnd(float(l)) for v, l in zip(variables, loadings)}}
+    return {"omega": _rnd(omega_val), "alpha": _rnd(alpha), "loadings": {v: _rnd(float(l)) for v, l in zip(variables, loadings)},
+            "note": "single-factor approximation; assumes a unidimensional scale (verify with 'factor')."}
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -55,9 +55,61 @@ def _ensure_irt():
         try:
             import girth as _girth_mod
             _girth = _girth_mod
+            _apply_scipy_compat_shim()
         except ImportError as e:
             _girth_import_error = str(e)
             raise
+
+
+def _apply_scipy_compat_shim():
+    """Restore scalar-return semantics for girth's internal fminbound calls.
+
+    girth 0.8.0's threepl_mml path funnels through _mml_abstract, whose
+    objective returns a size-1 array. scipy <1.14 tolerated that inside
+    fminbound; scipy ≥1.14 returns an array, which then fails on assignment
+    ("setting an array element with a sequence") — making threepl_mml fail
+    on ALL data. Wrapping the module-level fminbound reference to squeeze
+    the objective output restores the old behaviour. Defensive: any failure
+    here just leaves girth unpatched (3PL keeps its graceful error path).
+    """
+    global _girth
+    try:
+        import sys
+        from scipy import optimize as _opt
+        _orig = _opt.fminbound
+
+        def _scalar_fminbound(func, *a, **k):
+            def _wrapped(x):
+                try:
+                    return float(np.asarray(func(x)).squeeze())
+                except (TypeError, ValueError):
+                    return func(x)
+            r = _orig(_wrapped, *a, **k)
+            try:
+                return float(np.asarray(r).squeeze())
+            except (TypeError, ValueError):
+                return r
+
+        for _mod in (
+            "girth.unidimensional.dichotomous.rasch_mml",
+            "girth.unidimensional.dichotomous.threepl_mml",
+        ):
+            _m = sys.modules.get(_mod)
+            if _m is not None and getattr(_m, "fminbound", None) is _orig:
+                setattr(_m, "fminbound", _scalar_fminbound)
+    except Exception:
+        pass
+
+
+def _to_girth(data: np.ndarray) -> np.ndarray:
+    """Transpose (n_people, n_items) → girth's (n_items, n_people) layout.
+
+    EVERY girth estimator and ability function expects items × people;
+    passing people × items silently swaps items for respondents (item
+    estimates come back person-length). Centralise the transpose here so
+    no call site can forget it.
+    """
+    return np.ascontiguousarray(data.T)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -119,11 +171,15 @@ def _prepare_for_girth(data: np.ndarray) -> np.ndarray:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Output helpers — girth MML has swapped naming in its results dict:
-#   "Difficulty"   → person ability estimates (theta)
-#   "Ability"      → item difficulty estimates (beta)
-#   "Discrimination" → item discrimination (alpha)
-# We remap to canonical IRT names for agent consumption.
+# Output helpers — girth's canonical result-dict naming (verified against
+# girth 0.8.0 with correctly-oriented items × people input):
+#   "Difficulty"     → item difficulty estimates (n_items; 2D thresholds
+#                       for GRM/PCM: n_items × n_thresholds)
+#   "Discrimination" → item discrimination estimates (n_items)
+#   "Guessing"       → item guessing estimates, 3PL only (n_items)
+#   "Ability"        → person ability estimates (n_people)
+# Lengths are validated against the data shape; anything person-length is
+# never reported as an item parameter (and vice versa).
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -136,31 +192,26 @@ def _build_model_out(result: dict, data: np.ndarray, polytomous: bool = False) -
         "n_people": n_people,
     }
 
-    # Item difficulty — 1D for dichotomous, 2D for polytomous.
-    # Rasch/JML returns person/thetas under different keys and may carry
-    # NO item-difficulty vector at all — report what exists, warn on gaps.
-    item_diff = result.get("Ability")
+    # Item difficulty — 1D for dichotomous, 2D (thresholds) for polytomous.
+    item_diff = result.get("Difficulty")
     if item_diff is None:
-        # JML variants stash difficulties under alternate keys
-        for alt in ("Beta", "Difficulty", "item_difficulty", "difficulties"):
+        for alt in ("Beta", "item_difficulty", "difficulties"):
             if result.get(alt) is not None:
                 item_diff = result.get(alt)
                 break
     if item_diff is not None:
         try:
             arr = np.asarray(item_diff, dtype=float)
-            if polytomous and arr.ndim == 2:
+            if polytomous and arr.ndim == 2 and arr.shape[0] == n_items:
                 out["d"] = [[_fmt(float(v)) for v in row] for row in arr]
             else:
                 vals = arr.flatten()
                 if len(vals) == n_items:
                     out["d"] = [_fmt(float(v)) for v in vals]
-                elif len(vals) == n_people:
-                    # Mislabeled person-ability vector — keep under a, not d
-                    out["a"] = [_fmt(float(v)) for v in vals]
-                    out["warn_d"] = "item difficulties absent; person abilities in a"
                 else:
-                    out["warn_d"] = f"difficulty length {len(vals)} matches neither n_items {n_items} nor n_people {n_people}"
+                    out["warn_d"] = (
+                        f"difficulty length {len(vals)} != n_items {n_items}; omitted"
+                    )
         except (TypeError, ValueError):
             pass
     else:
@@ -172,35 +223,37 @@ def _build_model_out(result: dict, data: np.ndarray, polytomous: bool = False) -
             vals = np.asarray(item_disc, dtype=float).flatten()
             if len(vals) == n_items:
                 out["disc"] = [_fmt(float(v)) for v in vals]
-            elif len(vals) == n_people:
-                out["warn_disc"] = (
-                    f"discrimination length {len(vals)} = n_people, not n_items {n_items}; "
-                    "estimator returned person-length vector — omitted"
-                )
+            elif len(vals) == 1:
+                # Scalar constraint (e.g. onepl_mml fixed discrimination)
+                out["disc"] = [_fmt(float(vals[0]))] * n_items
             else:
-                out["warn_disc"] = f"discrimination length {len(vals)} != n_items {n_items}; omitted"
+                out["warn_disc"] = (
+                    f"discrimination length {len(vals)} != n_items {n_items}; omitted"
+                )
         except (TypeError, ValueError):
             pass
 
     # Guessing (3PL only)
     guess = result.get("Guessing")
     if guess is not None:
-        out["g"] = [_fmt(float(v)) for v in guess.flatten()]
+        try:
+            gvals = np.asarray(guess, dtype=float).flatten()
+            if len(gvals) == n_items:
+                out["g"] = [_fmt(float(v)) for v in gvals]
+        except (TypeError, ValueError):
+            pass
 
-    # Person ability — must be person-length; item-length vectors here are
-    # mislabeled difficulties, not abilities.
-    person_theta = result.get("Difficulty")
+    # Person ability — must be person-length.
+    person_theta = result.get("Ability")
     if person_theta is not None:
         try:
             vals = np.asarray(person_theta, dtype=float).flatten()
             if len(vals) == n_people:
                 out["a"] = [_fmt(float(v)) for v in vals]
-            elif len(vals) == n_items and "d" not in out:
-                out["d"] = [_fmt(float(v)) for v in vals]
-            elif "a" not in out:
-                out["a"] = [_fmt(float(v)) for v in vals[:n_people]] if len(vals) > n_people else [_fmt(float(v)) for v in vals]
-                if len(vals) != n_people:
-                    out["warn_a"] = f"ability length {len(vals)} != n_people {n_people}"
+            else:
+                out["warn_a"] = (
+                    f"ability length {len(vals)} != n_people {n_people}; omitted"
+                )
         except (TypeError, ValueError):
             pass
 
@@ -232,9 +285,9 @@ def _action_rasch(args: dict) -> str:
 
     try:
         if method == "mml":
-            result = _girth.onepl_mml(data)
+            result = _girth.onepl_mml(_to_girth(data))
         else:
-            result = _girth.rasch_jml(data)
+            result = _girth.rasch_jml(_to_girth(data))
     except Exception as e:
         return _err(f"Rasch {method.upper()} failed: {type(e).__name__}: {e}")
 
@@ -255,7 +308,7 @@ def _action_2pl(args: dict) -> str:
     data = _prepare_for_girth(data)
 
     try:
-        result = _girth.twopl_mml(data)
+        result = _girth.twopl_mml(_to_girth(data))
     except Exception as e:
         return _err(f"2PL MML failed: {type(e).__name__}: {e}")
 
@@ -275,7 +328,7 @@ def _action_3pl(args: dict) -> str:
     data = _prepare_for_girth(data)
 
     try:
-        result = _girth.threepl_mml(data)
+        result = _girth.threepl_mml(_to_girth(data))
     except Exception as e:
         return _err(
             f"3PL MML failed: {type(e).__name__}: {e}. "
@@ -306,7 +359,7 @@ def _action_grm(args: dict) -> str:
     data = data.astype(int)
 
     try:
-        result = _girth.grm_mml(data)
+        result = _girth.grm_mml(_to_girth(data))
     except Exception as e:
         return _err(f"GRM MML failed: {type(e).__name__}: {e}")
 
@@ -331,7 +384,7 @@ def _action_pcm(args: dict) -> str:
     data = data.astype(int)
 
     try:
-        result = _girth.pcm_mml(data)
+        result = _girth.pcm_mml(_to_girth(data))
     except Exception as e:
         return _err(f"PCM MML failed: {type(e).__name__}: {e}")
 
@@ -347,6 +400,9 @@ def _action_score(args: dict) -> str:
     guess_str = args.get("guess", "")
     method = args.get("method", "mle")
     model = args.get("model", "2pl")
+    if method not in ("mle", "eap", "map"):
+        # "jml"/"mml" are estimation methods (rasch), not scoring methods
+        method = "mle"
 
     if not d:
         return _err("irt_score requires 'd' (CSV response data)")
@@ -391,38 +447,86 @@ def _action_score(args: dict) -> str:
         )
 
     try:
-        # girth ability functions expect data as (n_items, n_people)
-        data_T = data.astype(float).T
-        if method == "eap":
-            try:
-                ability = _girth.ability_eap(data_T, diff, disc)
-            except TypeError:
-                ability = _girth.ability_eap(data_T, diff, disc, guess)
+        # girth ability functions expect data as (n_items, n_people).
+        data_T = _to_girth(data.astype(float))
+        use_3pl = (model == "3pl" and float(np.max(guess)) > 0)
+        if use_3pl:
+            # girth 0.8.0's ability_eap/mle/map take NO guessing parameter
+            # (4th positional is an options dict) — so 3PL scoring is done
+            # here directly: per-respondent bounded MLE under the 3PL ICC
+            # P = g + (1-g) * logit(a*(theta-b)), with SE from observed info.
+            ability, se = _score_3pl_mle(data, diff, disc, guess)
+            method = "mle-3pl"
+        elif method == "eap":
+            ability = _girth.ability_eap(data_T, diff, disc)
+            se = None
         elif method == "map":
-            try:
-                ability = _girth.ability_map(data_T, diff, disc)
-            except TypeError:
-                ability = _girth.ability_map(data_T, diff, disc, guess)
+            ability = _girth.ability_map(data_T, diff, disc)
+            se = None
         else:
-            # MLE has no guessing parameter in girth — for 3PL scoring
-            # (model=3pl + guess) fall back to EAP which honours it.
-            if model == "3pl" and float(np.max(guess)) > 0:
-                try:
-                    ability = _girth.ability_eap(data_T, diff, disc, guess)
-                    method = "eap"
-                except TypeError:
-                    ability = _girth.ability_mle(data_T, diff, disc)
-            else:
-                ability = _girth.ability_mle(data_T, diff, disc)
+            ability = _girth.ability_mle(data_T, diff, disc)
+            se = None
     except Exception as e:
         return _err(f"Ability scoring failed: {type(e).__name__}: {e}")
 
-    return _ok({
+    out = {
         "method": method,
         "model": model,
         "n": len(ability),
         "a": [_fmt(float(v)) for v in ability],
-    })
+    }
+    if se is not None:
+        out["se"] = [_fmt(float(v)) for v in se]
+    return _ok(out)
+
+
+def _score_3pl_mle(data: np.ndarray, diff: np.ndarray, disc: np.ndarray,
+                   guess: np.ndarray):
+    """Per-respondent MLE of theta under the 3PL model.
+
+    Maximises sum_j [y*log P + (1-y)*log(1-P)] over theta in [-6, 6] with
+    P_j = g_j + (1-g_j)/(1+exp(-a_j (theta-b_j))). Perfect/zero scores are
+    clipped to the boundary (their MLE is +/-infinity). Returns
+    (abilities, standard_errors); SE from observed information, None-safe.
+    """
+    from scipy.optimize import minimize_scalar
+    n_people = data.shape[0]
+    a = np.asarray(disc, dtype=float)
+    b = np.asarray(diff, dtype=float)
+    g = np.clip(np.asarray(guess, dtype=float), 0.0, 0.5)
+    theta_hat = np.zeros(n_people)
+    se_hat = np.full(n_people, np.nan)
+    for i in range(n_people):
+        y = data[i].astype(float)
+
+        def _nll(th):
+            z = np.clip(a * (th - b), -30, 30)
+            p = g + (1 - g) / (1 + np.exp(-z))
+            p = np.clip(p, 1e-10, 1 - 1e-10)
+            return float(-np.sum(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+        if np.all(y == 1):
+            theta_hat[i] = 6.0
+            continue
+        if np.all(y == 0):
+            theta_hat[i] = -6.0
+            continue
+        try:
+            res = minimize_scalar(_nll, bounds=(-6, 6), method="bounded",
+                                  options={"xatol": 1e-4})
+            th = float(res.x)
+        except (ValueError, TypeError):
+            th = 0.0
+        theta_hat[i] = th
+        # Observed information at the MLE for SE
+        h = 1e-4
+        try:
+            info = (_nll(th + h) - 2 * _nll(th) + _nll(th - h)) / (h * h)
+            if info > 0:
+                se_hat[i] = float(1 / math.sqrt(info))
+        except (ValueError, TypeError, ZeroDivisionError):
+            pass
+    return theta_hat, se_hat
 
 
 def _action_ctt(args: dict) -> str:

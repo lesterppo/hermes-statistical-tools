@@ -205,22 +205,41 @@ def _fmt_float(v: float) -> Optional[float]:
     return v
 
 
+def _sget(obj: Any, attr: str) -> Any:
+    """Safe getattr: return None when the attribute is missing OR when
+    accessing it raises (e.g. NominalGEE's llf/aic raise NotImplementedError
+    instead of being absent — hasattr() would propagate those)."""
+    try:
+        return getattr(obj, attr)
+    except Exception:
+        return None
+
+
 def _fmt_result(result, is_mixed: bool = False) -> dict:
     """Extract compact summary from a statsmodels result object.
 
     Works for: MixedLM, GEE, OrdinalGEE, NominalGEE results.
+
+    Note: several fit-stat attributes (llf, aic, bic) are properties that
+    RAISE NotImplementedError on NominalGEE instead of being absent, and
+    hasattr() does not swallow non-AttributeError exceptions — so every
+    attribute access here goes through the _sget() safe getter.
     """
     out: Dict[str, Any] = {}
 
     # Model fit stats
-    if hasattr(result, "llf"):
-        out["ll"] = _fmt_float(result.llf)
-    if hasattr(result, "aic"):
-        out["aic"] = _fmt_float(result.aic)
-    if hasattr(result, "bic"):
-        out["bic"] = _fmt_float(result.bic)
-    if hasattr(result, "scale"):
-        out["v"] = _fmt_float(result.scale)
+    _ll = _sget(result, "llf")
+    if _ll is not None:
+        out["ll"] = _fmt_float(_ll)
+    _aic = _sget(result, "aic")
+    if _aic is not None:
+        out["aic"] = _fmt_float(_aic)
+    _bic = _sget(result, "bic")
+    if _bic is not None:
+        out["bic"] = _fmt_float(_bic)
+    _scale = _sget(result, "scale")
+    if _scale is not None:
+        out["v"] = _fmt_float(_scale)
 
     # Fixed effects
     params = result.params
@@ -299,8 +318,9 @@ def _fmt_result(result, is_mixed: bool = False) -> dict:
                         out["rv"]["0"] = _fmt_float(float(rec[0]))
 
     # Convergence info
-    if hasattr(result, "converged"):
-        out["cnvg"] = bool(result.converged)
+    _cnvg = _sget(result, "converged")
+    if _cnvg is not None:
+        out["cnvg"] = bool(_cnvg)
 
     return out
 

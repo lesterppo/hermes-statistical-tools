@@ -442,7 +442,7 @@ def _power_ttest(args: dict) -> str:
     power = _noneable(args.get("pw"))
     alpha = _noneable(args.get("a"), default=0.05)
     ratio = _noneable(args.get("ratio"), default=1.0)
-    alt = args.get("alt", "two-sided")
+    alt = args.get("alt") or "two-sided"
     if alt not in ("two-sided", "larger", "smaller"):
         return _err("alt must be two-sided|larger|smaller")
     try:
