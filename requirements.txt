@@ -5,6 +5,7 @@
 # Core (all tools)
 numpy>=1.24,<3
 scipy>=1.10,<2
+pandas>=2.0,<3
 
 # PSPP tool (pure-Python PSPP 2.0.0 command set)
 # no extra deps

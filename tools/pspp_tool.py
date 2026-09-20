@@ -368,15 +368,16 @@ def _do_ttest(cols: dict, args: dict) -> dict:
     t, p = scipy_stats.ttest_ind(grps[0], grps[1], equal_var=False)
     v1, v2 = float(np.var(grps[0], ddof=1)), float(np.var(grps[1], ddof=1))
     n1, n2 = len(grps[0]), len(grps[1])
-    # Guard against zero variance (identical values)
+    # Guard against zero variance (identical values) — return stats WITH a
+    # warning key (not "e": pspp_run treats "e" as fatal and drops the payload).
     if v1 == 0 and v2 == 0:
         return {"n1": n1, "n2": n2, "m1": _rnd(float(np.mean(grps[0]))), "m2": _rnd(float(np.mean(grps[1]))),
                 "t": 0, "df": 0, "p": 1.0, "d": 0, "md": 0, "ci_l": None, "ci_u": None,
-                "e": "zero variance in both groups"}
+                "warn": "zero variance in both groups"}
     if v1 == 0 or v2 == 0:
         return {"n1": n1, "n2": n2, "m1": _rnd(float(np.mean(grps[0]))), "m2": _rnd(float(np.mean(grps[1]))),
                 "t": None, "df": None, "p": None, "d": None, "md": None, "ci_l": None, "ci_u": None,
-                "e": "zero variance in one group"}
+                "warn": "zero variance in one group"}
     df = (v1 / n1 + v2 / n2) ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
     md = float(np.mean(grps[1]) - np.mean(grps[0]))
     se = math.sqrt(v1 / n1 + v2 / n2)
@@ -848,7 +849,14 @@ def _do_logistic(cols: dict, args: dict) -> dict:
 def _do_factor(cols: dict, args: dict) -> dict:
     """Principal Component Analysis with varimax rotation."""
     variables = args.get("v", [])
-    n_components = args.get("n", len(variables))
+    n_in = args.get("n", 0)
+    try:
+        n_in = int(n_in) if n_in else 0
+    except (TypeError, ValueError):
+        n_in = 0
+    # Default: keep all components (min(n_vars, n_obs-1)) instead of
+    # silently returning empty when n=0 comes from the registry default.
+    n_components = n_in if n_in and n_in > 0 else len(variables)
     rotate = args.get("rotate", "varimax")
     if not variables or len(variables) < 2:
         return {"e": "v (2+ variables) required"}
@@ -952,37 +960,33 @@ def _do_roc(cols: dict, args: dict) -> dict:
     n_neg = n - n_pos
     if n_pos == 0 or n_neg == 0:
         return {"e": "Need both positive and negative cases"}
-    # Compute ROC points
-    tpr, fpr = [0], [0]
+    # Compute ROC points — one point per distinct score, AFTER counting
+    # all cases tied at that score (standard ROC construction).
+    tpr, fpr, thresh = [0.0], [0.0], [float("inf")]
     tp, fp = 0, 0
-    prev_score = None
-    for i in range(n):
-        if y_score[idx[i]] != prev_score:
-            tpr.append(tp / n_pos)
-            fpr.append(fp / n_neg)
-            prev_score = y_score[idx[i]]
-        if y_true[i] == 1:
-            tp += 1
-        else:
-            fp += 1
-    tpr.append(1)
-    fpr.append(1)
+    i = 0
+    order_scores = y_score[idx]
+    while i < n:
+        s = float(order_scores[i])
+        j = i
+        while j < n and float(order_scores[j]) == s:
+            if y_true[j] == 1:
+                tp += 1
+            else:
+                fp += 1
+            j += 1
+        tpr.append(tp / n_pos)
+        fpr.append(fp / n_neg)
+        thresh.append(s)
+        i = j
     # AUC via trapezoidal rule
     auc = 0.0
-    for i in range(len(fpr) - 1):
-        auc += (fpr[i + 1] - fpr[i]) * (tpr[i + 1] + tpr[i]) / 2
-    # Youden's J
+    for k in range(len(fpr) - 1):
+        auc += (fpr[k + 1] - fpr[k]) * (tpr[k + 1] + tpr[k]) / 2
+    # Youden's J (skip the inf point at index 0)
     J = np.array(tpr) - np.array(fpr)
     best_idx = int(np.argmax(J))
-    # Find threshold at best_idx
-    threshold = None
-    unique_idx = 0
-    for i in range(n):
-        if y_score[idx[i]] != (y_score[idx[i - 1]] if i > 0 else None):
-            if unique_idx == best_idx:
-                threshold = float(y_score[idx[i]])
-                break
-            unique_idx += 1
+    threshold = thresh[best_idx] if best_idx > 0 else None
     return {
         "AUC": _rnd(auc),
         "n_pos": n_pos, "n_neg": n_neg,
@@ -1060,27 +1064,55 @@ def _do_survival(cols: dict, args: dict) -> dict:
             result["median_surv"] = entry["t"]
             break
 
-    # Log-rank test (if group variable provided)
+    # Log-rank test (Mantel-Haenszel, event-time stratified; supports 2+ groups)
     if a and a in cols:
         groups = cols[a][:n]
         group_labels = sorted(set(str(g) for g in groups if _valid(g)))
         if len(group_labels) >= 2:
-            # Simple 2-group log-rank
-            g0_idx = [j for j, g_val in enumerate(groups) if str(g_val) == group_labels[0]]
-            g1_idx = [j for j, g_val in enumerate(groups) if str(g_val) == group_labels[1]]
-            # Observed events per group
-            O1 = int(sum(events_sorted[i] for i in range(n) if order[i] in set(g1_idx)))
-            O0 = int(sum(events_sorted[i] for i in range(n) if order[i] in set(g0_idx)))
-            # Expected under null (simplified — uses overall event rate)
-            total_events = int(sum(events_sorted))
-            n1, n0 = int(len(g1_idx)), int(len(g0_idx))
-            E1 = total_events * n1 / n if n > 0 else 0
-            E0 = total_events * n0 / n if n > 0 else 0
-            V = total_events * n1 * n0 * (n - total_events) / (n * n * (n - 1)) if n > 1 else 0
-            chi2 = (O1 - E1) ** 2 / V if V > 0 else 0
-            p_logrank = float(scipy_stats.chi2.sf(chi2, 1))
-            result["logrank"] = {"χ²": _rnd(chi2), "df": 1, "p": _rnd(p_logrank),
-                                "groups": group_labels, "O1": O1, "E1": _rnd(E1)}
+            # Map each sorted position back to its group
+            pos_group = [str(groups[order[i]]) for i in range(n)]
+            times_f = [float(times[i]) for i in range(n)]
+            ev_f = [int(events_sorted[i]) for i in range(n)]
+            if len(group_labels) == 2:
+                # Proper Mantel-Haenszel: risk set at t = all with time >= t
+                O1 = 0.0
+                E1 = 0.0
+                V = 0.0
+                for t in sorted(set(ti for ti, ei in zip(times_f, ev_f) if ei == 1)):
+                    risk = [i for i in range(n) if times_f[i] >= t - 1e-10]
+                    n_at = len(risk)
+                    n1_at = sum(1 for i in risk if pos_group[i] == group_labels[1])
+                    n0_at = n_at - n1_at
+                    d_at = sum(1 for i in risk if abs(times_f[i] - t) < 1e-10 and ev_f[i] == 1)
+                    d1_at = sum(1 for i in risk if abs(times_f[i] - t) < 1e-10 and ev_f[i] == 1 and pos_group[i] == group_labels[1])
+                    if n_at > 1 and d_at > 0 and n1_at > 0 and n0_at > 0:
+                        E1 += d_at * n1_at / n_at
+                        O1 += d1_at
+                        V += (n1_at * n0_at * d_at * (n_at - d_at)) / (n_at * n_at * (n_at - 1))
+                chi2 = (O1 - E1) ** 2 / V if V > 0 else 0.0
+                p_logrank = float(scipy_stats.chi2.sf(chi2, 1))
+                result["logrank"] = {"χ²": _rnd(chi2), "df": 1, "p": _rnd(p_logrank),
+                                    "groups": group_labels[:2], "O1": _rnd(O1), "E1": _rnd(E1)}
+            else:
+                # k-group Mantel-Haenszel: sum (O-E)^2/V per group, df=k-1
+                k = len(group_labels)
+                Os, Es, Vs = [0.0] * k, [0.0] * k, [0.0] * k
+                for t in sorted(set(ti for ti, ei in zip(times_f, ev_f) if ei == 1)):
+                    risk = [i for i in range(n) if times_f[i] >= t - 1e-10]
+                    n_at = len(risk)
+                    d_at = sum(1 for i in risk if abs(times_f[i] - t) < 1e-10 and ev_f[i] == 1)
+                    if n_at > 1 and d_at > 0:
+                        for gi, gl in enumerate(group_labels):
+                            n_at_g = sum(1 for i in risk if pos_group[i] == gl)
+                            d_at_g = sum(1 for i in risk if abs(times_f[i] - t) < 1e-10 and ev_f[i] == 1 and pos_group[i] == gl)
+                            if n_at_g > 0:
+                                Es[gi] += d_at * n_at_g / n_at
+                                Os[gi] += d_at_g
+                                Vs[gi] += (n_at_g * (n_at - n_at_g) * d_at * (n_at - d_at)) / (n_at * n_at * (n_at - 1))
+                chi2 = sum((Os[gi] - Es[gi]) ** 2 / Vs[gi] for gi in range(k) if Vs[gi] > 0)
+                p_logrank = float(scipy_stats.chi2.sf(chi2, k - 1))
+                result["logrank"] = {"χ²": _rnd(chi2), "df": k - 1, "p": _rnd(p_logrank),
+                                    "groups": group_labels}
 
     return result
 
@@ -1291,22 +1323,27 @@ def _do_kappa(cols: dict, args: dict) -> dict:
     w = args.get("w", "unweighted")
     if not a or not v or a not in cols or v not in cols:
         return {"e": "a (rater1), v (rater2) required"}
-    r1 = _arr(cols[a])
-    r2 = _arr(cols[v])
-    n = min(len(r1), len(r2))
-    r1, r2 = r1[:n], r2[:n]
-    # Get unique categories
-    cats = sorted(set(int(x) for x in np.concatenate([r1, r2]) if not math.isnan(x)))
+    # Accept string categories as well as numeric ratings (no int truncation)
+    r1s = [cols[a][i] for i in range(min(len(cols[a]), len(cols[v])))]
+    r2s = [cols[v][i] for i in range(min(len(cols[a]), len(cols[v])))]
+    pairs = [(x, y) for x, y in zip(r1s, r2s)
+             if x is not None and y is not None
+             and not (isinstance(x, float) and math.isnan(x))
+             and not (isinstance(y, float) and math.isnan(y))]
+    if not pairs:
+        return {"e": "No complete pairs"}
+    cats = sorted(set([p[0] for p in pairs] + [p[1] for p in pairs]),
+                  key=lambda x: (isinstance(x, str), x))
+    # Numeric-like floats that are whole numbers stay numeric; do NOT
+    # truncate genuine fractional ratings — keep them as distinct labels.
     if len(cats) < 2:
         return {"e": f"Need ≥2 categories, got {cats}"}
     k = len(cats)
     # Build agreement matrix
     obs = np.zeros((k, k))
-    for i in range(n):
-        if not math.isnan(r1[i]) and not math.isnan(r2[i]):
-            idx1 = cats.index(int(r1[i]))
-            idx2 = cats.index(int(r2[i]))
-            obs[idx1, idx2] += 1
+    for x, y in pairs:
+        obs[cats.index(x), cats.index(y)] += 1
+    n = len(pairs)
     total = np.sum(obs)
     p_o = np.trace(obs) / total if total > 0 else 0
     # Expected agreement
@@ -1344,12 +1381,38 @@ def _do_evalue(cols: dict, args: dict) -> dict:
         or_val = args.get("or")
         rr_val = args.get("rr")
         if or_val is not None:
-            e_val = or_val + math.sqrt(or_val * (or_val - 1))
-            return {"OR": or_val, "E_value": _rnd(e_val),
-                    "E_lower": _rnd(1 + math.sqrt(1 - 1/or_val) if or_val > 1 else 0)}
+            try:
+                ov = float(or_val)
+            except (TypeError, ValueError):
+                return {"e": "or must be numeric"}
+            if ov <= 0:
+                return {"e": "or must be > 0"}
+            if ov <= 1:
+                # Protective / null effect: E-value is 1 (no unmeasured
+                # confounding needed to explain away). Use the reciprocal
+                # so the magnitude is still informative.
+                inv = 1.0 / ov if ov > 0 else float("inf")
+                e_val = inv + math.sqrt(inv * (inv - 1)) if inv > 1 else 1.0
+                return {"OR": ov, "E_value": _rnd(e_val),
+                        "E_lower": _rnd(0),
+                        "note": "OR<=1: E-value computed on reciprocal (protective effect)"}
+            e_val = ov + math.sqrt(ov * (ov - 1))
+            return {"OR": ov, "E_value": _rnd(e_val),
+                    "E_lower": _rnd(1 + math.sqrt(1 - 1/ov) if ov > 1 else 0)}
         else:
-            e_val = rr_val + math.sqrt(rr_val * (rr_val - 1))
-            return {"RR": rr_val, "E_value": _rnd(e_val)}
+            try:
+                rv = float(rr_val)
+            except (TypeError, ValueError):
+                return {"e": "rr must be numeric"}
+            if rv <= 0:
+                return {"e": "rr must be > 0"}
+            if rv <= 1:
+                inv = 1.0 / rv if rv > 0 else float("inf")
+                e_val = inv + math.sqrt(inv * (inv - 1)) if inv > 1 else 1.0
+                return {"RR": rv, "E_value": _rnd(e_val),
+                        "note": "RR<=1: E-value computed on reciprocal (protective effect)"}
+            e_val = rv + math.sqrt(rv * (rv - 1))
+            return {"RR": rv, "E_value": _rnd(e_val)}
     # Compute OR from 2x2 data
     a = args.get("a", "")
     v = args.get("v", "")
@@ -1463,8 +1526,13 @@ def _do_power(cols: dict, args: dict) -> dict:
             return {"n1": math.ceil(n1), "n2": math.ceil(n2), "n_total": math.ceil(n1 + n2),
                     "d": d, "alpha": alpha, "power": power_target}
         else:
-            # Power given n
-            n1 = args.get("n1", 30)
+            # Power given n — honour caller n (n / n1 / n_per_group), default 30
+            n1 = args.get("n1", args.get("n", args.get("n_per_group", 30)))
+            try:
+                n1 = int(float(n1))
+            except (TypeError, ValueError):
+                n1 = 30
+            n1 = max(n1, 2)
             n2 = n1 * ratio
             ncp = d * math.sqrt(n1 * n2 / (n1 + n2))
             df = n1 + n2 - 2
@@ -1480,7 +1548,12 @@ def _do_power(cols: dict, args: dict) -> dict:
             n = (z_alpha * math.sqrt(2 * p_bar * (1 - p_bar)) + z_beta * math.sqrt(p0 * (1 - p0) + p1 * (1 - p1))) ** 2 / (p1 - p0) ** 2
             return {"n_per_group": math.ceil(n), "n_total": math.ceil(2 * n), "p0": p0, "p1": p1, "alpha": alpha, "power": power_target}
         else:
-            n = args.get("n_per_group", 30)
+            n = args.get("n_per_group", args.get("n", args.get("n1", 30)))
+            try:
+                n = int(float(n))
+            except (TypeError, ValueError):
+                n = 30
+            n = max(n, 2)
             z_alpha = norm.ppf(1 - alpha / 2)
             se = math.sqrt(p0 * (1 - p0) / n + p1 * (1 - p1) / n)
             z_power = (abs(p1 - p0) - z_alpha * math.sqrt(2 * p0 * (1 - p0) / n)) / se if se > 0 else 0
@@ -1497,7 +1570,23 @@ def _do_power(cols: dict, args: dict) -> dict:
             return {"n_per_group": math.ceil(n_per_group), "n_total": math.ceil(n_per_group * groups),
                     "groups": groups, "f": f_val, "alpha": alpha, "power": power_target}
         else:
-            return {"e": "ANOVA power given n not yet implemented"}
+            # Noncentral-F power given per-group n
+            n_pg = args.get("n_per_group", args.get("n", args.get("n1", 30)))
+            try:
+                n_pg = int(float(n_pg))
+            except (TypeError, ValueError):
+                n_pg = 30
+            n_pg = max(n_pg, 2)
+            from scipy.stats import ncf as _ncf, f as _fdist
+            f_val = d
+            lam = groups * n_pg * f_val ** 2
+            df1 = groups - 1
+            df2 = groups * (n_pg - 1)
+            f_crit = _fdist.ppf(1 - alpha, df1, df2)
+            power = float(1 - _ncf.cdf(f_crit, df1, df2, lam))
+            return {"power": _rnd(power), "n_per_group": n_pg,
+                    "n_total": n_pg * groups, "groups": groups,
+                    "f": f_val, "alpha": alpha}
 
     return {"e": f"Unknown test '{test}' or calc '{calc}'"}
 
@@ -1639,7 +1728,12 @@ def _do_negbin(cols: dict, args: dict) -> dict:
 # ─── MEDIATION ANALYSIS ────────────────────────────────────────────
 
 def _do_mediation(cols: dict, args: dict) -> dict:
-    """Mediation analysis: Baron-Kenny + bootstrap indirect effect CI."""
+    """Mediation analysis: Baron-Kenny + bootstrap indirect effect CI.
+
+    NOTE: covariate-adjusted mediation (p=covariates) is not yet implemented —
+    all paths are unadjusted OLS. Pass p only for forward-compat; it is
+    reported back so callers know it was ignored.
+    """
     o = args.get("o", "")     # outcome
     a = args.get("a", "")     # treatment/exposure (X)
     v = args.get("v", "")     # mediator (M)
@@ -1699,6 +1793,7 @@ def _do_mediation(cols: dict, args: dict) -> dict:
         "prop_mediated": _rnd(prop_med),
         "indirect_ci": [_rnd(ci_low), _rnd(ci_high)],
         "paths": {"a": _rnd(a_coef), "b": _rnd(b_coef), "c": _rnd(c_total), "c_prime": _rnd(c_prime)},
+        "note": "unadjusted OLS paths — covariates in p are ignored" if covariates else "unadjusted OLS paths",
     }
 
 
@@ -2221,6 +2316,8 @@ def pspp_run(
             "posthoc": posthoc.strip().lower() if posthoc else "",
             "rotate": rotate.strip().lower() if rotate else "",
             "n": n,
+            "n1": n,
+            "n_per_group": n,
             "pos": pos,
             "pos_ref": pos_ref,
             "effect_col": effect_col.strip() if effect_col else "",
@@ -2259,7 +2356,7 @@ PSPP_SCHEMA = {
     "name": "pspp",
     "description": (
         "Statistical analysis (statistics-masterclass complete, pure Python). "
-        "33 test types. "
+        f"{len(_ANALYSES)} test types. "
         "Descriptive: desc, freq, examine, means, crosstab. "
         "Compare means: ttest, pttest, ttest1, anova. "
         "Non-parametric: mw, kw, wilcoxon, friedman, sign, ks, runs. "
@@ -2334,6 +2431,24 @@ PSPP_SCHEMA = {
                 "type": "number",
                 "description": "Positive class label (roc).",
             },
+            "pos_ref": {"type": "number", "description": "Positive reference class (eval)."},
+            "effect_col": {"type": "string", "description": "Effect size column name (meta)."},
+            "se_col": {"type": "string", "description": "SE column name (meta)."},
+            "power_test": {"type": "string", "description": "ttest|prop|anova (power)."},
+            "alpha": {"type": "number", "description": "Significance level (power)."},
+            "es_val": {"type": "number", "description": "Effect size (power)."},
+            "ratio": {"type": "number", "description": "n2/n1 ratio (power)."},
+            "k": {"type": "integer", "description": "Groups (power/anova)."},
+            "p0": {"type": "number", "description": "Baseline proportion (power prop)."},
+            "p1": {"type": "number", "description": "Alternative proportion (power prop)."},
+            "calc": {"type": "string", "description": "'n' sample size | 'power' power (power)."},
+            "or_val": {"type": "number", "description": "Direct OR (evalue)."},
+            "rr_val": {"type": "number", "description": "Direct RR (evalue)."},
+            "tvar": {"type": "string", "description": "Time variable (surv)."},
+            "tau": {"type": "number", "description": "Quantile level (quantreg)."},
+            "lam": {"type": "number", "description": "Penalty (lasso)."},
+            "df": {"type": "integer", "description": "DF (gam)."},
+            "lags": {"type": "integer", "description": "Lags (adf)."},
         },
         "required": ["t", "d"],
     },
@@ -2370,6 +2485,20 @@ registry.register(
         lags=args.get("lags", 1),
         n=args.get("n", 0),
         pos=args.get("pos", 1),
+        pos_ref=args.get("pos_ref", 1),
+        effect_col=args.get("effect_col", ""),
+        se_col=args.get("se_col", ""),
+        power_test=args.get("power_test", ""),
+        alpha=args.get("alpha", 0.05),
+        es_val=args.get("es_val", 0.5),
+        ratio=args.get("ratio", 1.0),
+        k=args.get("k", 2),
+        p0=args.get("p0", 0.5),
+        p1=args.get("p1", 0.7),
+        calc=args.get("calc", ""),
+        or_val=args.get("or_val"),
+        rr_val=args.get("rr_val"),
+        tvar=args.get("tvar", ""),
     ),
     check_fn=lambda: True,
     emoji="📊",

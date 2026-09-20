@@ -150,21 +150,26 @@ def _surv_km(args: dict) -> str:
     out: Dict[str, Any] = {}
 
     if gcol and gcol in df.columns:
-        G = _to_num(df[gcol]).values
-        groups = sorted(set(G.astype(int).tolist()))
+        # Group labels preserved verbatim (no int truncation — float
+        # durations and string groups both survive).
+        import pandas as _pd_local
+        codes, uniques = _pd_local.factorize(df[gcol])
+        G = codes.astype(float)
+        groups = sorted(set(int(x) for x in codes))
+        glabel = {int(c): str(uniques[c]) for c in range(len(uniques))}
         out["g"] = {}
         for gi in groups:
-            mask = G == gi
+            mask = codes == gi
             km = _lf.KaplanMeierFitter()
             km.fit(T[mask], event_observed=E[mask])
             ts = km.survival_function_["KM_estimate"]
             ci = km.confidence_interval_
-            surv = {str(int(k)): _f(v) for k, v in ts.items()}
-            lo = {str(int(k)): _f(v) for k, v in ci.iloc[:, 0].items()}
-            hi = {str(int(k)): _f(v) for k, v in ci.iloc[:, 1].items()}
+            surv = {str(k): _f(v) for k, v in ts.items()}
+            lo = {str(k): _f(v) for k, v in ci.iloc[:, 0].items()}
+            hi = {str(k): _f(v) for k, v in ci.iloc[:, 1].items()}
             et = km.event_table
             at_risk_last = int(et["at_risk"].iloc[-1]) if "at_risk" in et else None
-            out["g"][str(int(gi))] = {
+            out["g"][glabel[gi]] = {
                 "n": int(mask.sum()),
                 "median": _f(km.median_survival_time_),
                 "at_risk": at_risk_last,
@@ -175,14 +180,15 @@ def _surv_km(args: dict) -> str:
         # Log-rank across groups
         if len(groups) == 2:
             a, b = groups
-            ma, mb = (G == a), (G == b)
+            ma, mb = (codes == a), (codes == b)
             res = _lf_stat.logrank_test(
                 T[ma], T[mb], event_observed_A=E[ma], event_observed_B=E[mb]
             )
-            out["logrank"] = {"z": _f(res.test_statistic), "p": _f(res.p_value)}
+            out["logrank"] = {"z": _f(res.test_statistic), "p": _f(res.p_value),
+                              "g1": glabel[a], "g2": glabel[b]}
         else:
             try:
-                res = _lf_stat.multivariate_logrank_test(T, G, E)
+                res = _lf_stat.multivariate_logrank_test(T, codes, E)
                 out["logrank"] = {"z": _f(res.test_statistic), "p": _f(res.p_value),
                                   "k": len(groups)}
             except Exception:
@@ -195,9 +201,9 @@ def _surv_km(args: dict) -> str:
         out = {
             "n": int(len(T)),
             "median": _f(km.median_survival_time_),
-            "surv": {str(int(k)): _f(v) for k, v in ts.items()},
-            "lo": {str(int(k)): _f(v) for k, v in ci.iloc[:, 0].items()},
-            "hi": {str(int(k)): _f(v) for k, v in ci.iloc[:, 1].items()},
+            "surv": {str(k): _f(v) for k, v in ts.items()},
+            "lo": {str(k): _f(v) for k, v in ci.iloc[:, 0].items()},
+            "hi": {str(k): _f(v) for k, v in ci.iloc[:, 1].items()},
         }
         et = km.event_table
         if "at_risk" in et:
@@ -276,16 +282,17 @@ def _surv_logrank(args: dict) -> str:
             return _err(f"logrank requires column '{c}' in data")
     T = _to_num(df[Tcol]).values
     E = _to_num(df[Ecol]).values
-    G = _to_num(df[gcol]).values
-    groups = sorted(set(G.astype(int).tolist()))
-    if len(groups) != 2:
-        return _err(f"logrank needs exactly 2 groups, found {len(groups)}: {groups}")
-    a, b = groups
-    ma, mb = (G == a), (G == b)
+    import pandas as _pd_lr
+    codes, uniques = _pd_lr.factorize(df[gcol])
+    if len(uniques) != 2:
+        return _err(f"logrank needs exactly 2 groups, found {len(uniques)}: {list(uniques)}")
+    labels = [str(u) for u in uniques]
+    ma, mb = (codes == 0), (codes == 1)
     res = _lf_stat.logrank_test(
         T[ma], T[mb], event_observed_A=E[ma], event_observed_B=E[mb]
     )
     return _ok({"z": _f(res.test_statistic), "p": _f(res.p_value),
+                "g1": labels[0], "g2": labels[1],
                 "n1": int(ma.sum()), "n2": int(mb.sum())})
 
 
@@ -315,6 +322,10 @@ def _meta_forest(args: dict) -> str:
     for cand in ("vi", "var", "se2"):
         if cand in df.columns:
             vi_c = cand
+            break
+    for cand in ("label", "study", "name", "id", "author"):
+        if cand in df.columns:
+            lab_c = cand
             break
     if "se" in df.columns and vi_c is None:
         df["_vi_from_se"] = df["se"].astype(float) ** 2

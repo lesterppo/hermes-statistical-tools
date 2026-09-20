@@ -91,10 +91,23 @@ def _fmt(v: float) -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════════
 
 _model_cache: Dict[str, Any] = {}
+_cache_lock = threading.Lock()
+_CACHE_MAX = 32
 
 
-def _cache_key(desc: str) -> str:
-    return desc.strip()
+def _cache_key(desc: str, d: str) -> str:
+    import hashlib
+    h = hashlib.sha256(d.strip().encode("utf-8")).hexdigest()[:16]
+    return desc.strip() + "\x00" + h
+
+
+def _cache_put(key: str, model: Any) -> None:
+    with _cache_lock:
+        if key in _model_cache:
+            _model_cache.pop(key)
+        while len(_model_cache) >= _CACHE_MAX:
+            _model_cache.pop(next(iter(_model_cache)))
+        _model_cache[key] = model
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -124,8 +137,8 @@ def _action_fit(args: dict) -> str:
         return _err(f"SEM fit failed: {type(e).__name__}: {e}")
 
     # Cache the model for later inspection
-    key = _cache_key(desc)
-    _model_cache[key] = model
+    key = _cache_key(desc, d)
+    _cache_put(key, model)
 
     # Parameter estimates
     insp = model.inspect()
@@ -201,6 +214,7 @@ def _action_fit(args: dict) -> str:
 def _action_inspect(args: dict) -> str:
     """Inspect a cached fitted model."""
     desc = args.get("desc", "")
+    d = args.get("d", "")
     mode = args.get("mode", "raw")
 
     if not desc:
@@ -208,8 +222,17 @@ def _action_inspect(args: dict) -> str:
 
     _ensure_sem()
 
-    key = _cache_key(desc)
-    model = _model_cache.get(key)
+    if d:
+        key = _cache_key(desc, d)
+        model = _model_cache.get(key)
+    else:
+        # Back-compat: no data hash — match the most recent fit for this desc
+        model = None
+        with _cache_lock:
+            for k in reversed(list(_model_cache.keys())):
+                if k.split("\x00", 1)[0] == desc.strip():
+                    model = _model_cache[k]
+                    break
     if model is None:
         return _err(
             f"No fitted model cached for this description. Run sem_fit first "

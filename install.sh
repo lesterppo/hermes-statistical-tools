@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hermes Statistical Tools — dependency installer
-# Installs Python packages needed by the four statistical tools.
+# Installs Python packages needed by the five statistical tools.
 set -euo pipefail
 
 echo "=== Hermes Statistical Tools Installer ==="

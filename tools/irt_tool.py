@@ -129,38 +129,80 @@ def _prepare_for_girth(data: np.ndarray) -> np.ndarray:
 
 def _build_model_out(result: dict, data: np.ndarray, polytomous: bool = False) -> dict:
     """Build compact output from girth result dict."""
+    n_items = data.shape[1]
+    n_people = data.shape[0]
     out: Dict[str, Any] = {
-        "n_items": data.shape[1],
-        "n_people": data.shape[0],
+        "n_items": n_items,
+        "n_people": n_people,
     }
 
-    # Item difficulty — 1D for dichotomous, 2D for polytomous
+    # Item difficulty — 1D for dichotomous, 2D for polytomous.
+    # Rasch/JML returns person/thetas under different keys and may carry
+    # NO item-difficulty vector at all — report what exists, warn on gaps.
     item_diff = result.get("Ability")
+    if item_diff is None:
+        # JML variants stash difficulties under alternate keys
+        for alt in ("Beta", "Difficulty", "item_difficulty", "difficulties"):
+            if result.get(alt) is not None:
+                item_diff = result.get(alt)
+                break
     if item_diff is not None:
-        if polytomous and item_diff.ndim == 2:
-            out["d"] = [[_fmt(float(v)) for v in row] for row in item_diff]
-        else:
-            vals = item_diff.flatten()
-            if vals.ndim == 1:
-                out["d"] = [_fmt(float(v)) for v in vals]
+        try:
+            arr = np.asarray(item_diff, dtype=float)
+            if polytomous and arr.ndim == 2:
+                out["d"] = [[_fmt(float(v)) for v in row] for row in arr]
+            else:
+                vals = arr.flatten()
+                if len(vals) == n_items:
+                    out["d"] = [_fmt(float(v)) for v in vals]
+                elif len(vals) == n_people:
+                    # Mislabeled person-ability vector — keep under a, not d
+                    out["a"] = [_fmt(float(v)) for v in vals]
+                    out["warn_d"] = "item difficulties absent; person abilities in a"
+                else:
+                    out["warn_d"] = f"difficulty length {len(vals)} matches neither n_items {n_items} nor n_people {n_people}"
+        except (TypeError, ValueError):
+            pass
+    else:
+        out["warn_d"] = "no item-difficulty vector in estimator output (rasch-jml)"
 
     item_disc = result.get("Discrimination")
     if item_disc is not None:
-        vals = item_disc.flatten()
-        if vals.ndim == 1:
-            out["disc"] = [_fmt(float(v)) for v in vals]
+        try:
+            vals = np.asarray(item_disc, dtype=float).flatten()
+            if len(vals) == n_items:
+                out["disc"] = [_fmt(float(v)) for v in vals]
+            elif len(vals) == n_people:
+                out["warn_disc"] = (
+                    f"discrimination length {len(vals)} = n_people, not n_items {n_items}; "
+                    "estimator returned person-length vector — omitted"
+                )
+            else:
+                out["warn_disc"] = f"discrimination length {len(vals)} != n_items {n_items}; omitted"
+        except (TypeError, ValueError):
+            pass
 
     # Guessing (3PL only)
     guess = result.get("Guessing")
     if guess is not None:
         out["g"] = [_fmt(float(v)) for v in guess.flatten()]
 
-    # Person ability
+    # Person ability — must be person-length; item-length vectors here are
+    # mislabeled difficulties, not abilities.
     person_theta = result.get("Difficulty")
     if person_theta is not None:
-        vals = person_theta.flatten()
-        if vals.ndim == 1:
-            out["a"] = [_fmt(float(v)) for v in vals]
+        try:
+            vals = np.asarray(person_theta, dtype=float).flatten()
+            if len(vals) == n_people:
+                out["a"] = [_fmt(float(v)) for v in vals]
+            elif len(vals) == n_items and "d" not in out:
+                out["d"] = [_fmt(float(v)) for v in vals]
+            elif "a" not in out:
+                out["a"] = [_fmt(float(v)) for v in vals[:n_people]] if len(vals) > n_people else [_fmt(float(v)) for v in vals]
+                if len(vals) != n_people:
+                    out["warn_a"] = f"ability length {len(vals)} != n_people {n_people}"
+        except (TypeError, ValueError):
+            pass
 
     # Fit stats
     for key in ("AIC", "BIC"):
@@ -253,7 +295,15 @@ def _action_grm(args: dict) -> str:
         return _err("irt_grm requires 'd' (CSV data)")
 
     _ensure_irt()
-    data = _parse_matrix(d).astype(int)
+    data = _parse_matrix(d)
+    # Listwise deletion identical to the binary path — .astype(int) on NaN
+    # raises instead of dropping.
+    if np.isnan(data).any():
+        valid = ~np.isnan(data).any(axis=1)
+        data = data[valid]
+        if len(data) == 0:
+            return _err("no complete cases after dropping missing values")
+    data = data.astype(int)
 
     try:
         result = _girth.grm_mml(data)
@@ -272,7 +322,13 @@ def _action_pcm(args: dict) -> str:
         return _err("irt_pcm requires 'd' (CSV data)")
 
     _ensure_irt()
-    data = _parse_matrix(d).astype(int)
+    data = _parse_matrix(d)
+    if np.isnan(data).any():
+        valid = ~np.isnan(data).any(axis=1)
+        data = data[valid]
+        if len(data) == 0:
+            return _err("no complete cases after dropping missing values")
+    data = data.astype(int)
 
     try:
         result = _girth.pcm_mml(data)
@@ -325,21 +381,45 @@ def _action_score(args: dict) -> str:
         return _err(
             f"diff has {len(diff)} values but data has {data.shape[1]} items"
         )
+    if len(disc) != data.shape[1]:
+        return _err(
+            f"disc has {len(disc)} values but data has {data.shape[1]} items"
+        )
+    if len(guess) != data.shape[1]:
+        return _err(
+            f"guess has {len(guess)} values but data has {data.shape[1]} items"
+        )
 
     try:
         # girth ability functions expect data as (n_items, n_people)
         data_T = data.astype(float).T
         if method == "eap":
-            ability = _girth.ability_eap(data_T, diff, disc)
+            try:
+                ability = _girth.ability_eap(data_T, diff, disc)
+            except TypeError:
+                ability = _girth.ability_eap(data_T, diff, disc, guess)
         elif method == "map":
-            ability = _girth.ability_map(data_T, diff, disc)
+            try:
+                ability = _girth.ability_map(data_T, diff, disc)
+            except TypeError:
+                ability = _girth.ability_map(data_T, diff, disc, guess)
         else:
-            ability = _girth.ability_mle(data_T, diff, disc)
+            # MLE has no guessing parameter in girth — for 3PL scoring
+            # (model=3pl + guess) fall back to EAP which honours it.
+            if model == "3pl" and float(np.max(guess)) > 0:
+                try:
+                    ability = _girth.ability_eap(data_T, diff, disc, guess)
+                    method = "eap"
+                except TypeError:
+                    ability = _girth.ability_mle(data_T, diff, disc)
+            else:
+                ability = _girth.ability_mle(data_T, diff, disc)
     except Exception as e:
         return _err(f"Ability scoring failed: {type(e).__name__}: {e}")
 
     return _ok({
         "method": method,
+        "model": model,
         "n": len(ability),
         "a": [_fmt(float(v)) for v in ability],
     })

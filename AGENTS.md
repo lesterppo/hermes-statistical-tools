@@ -18,11 +18,12 @@ cp tools/*.py ~/.hermes/hermes-agent/tools/
 
 # Verify
 python3 -c "
-from tools.pspp_tool import _check_pspp
 from tools.statsmodels_tool import _check_statsmodels
 from tools.sem_tool import _check_sem
 from tools.irt_tool import _check_irt
 from tools.medical_ext_tool import _check_backends
+print('pspp always available (pure Python, no check fn)')
+print('statsmodels:', _check_statsmodels())
 print('All OK')
 "
 ```
