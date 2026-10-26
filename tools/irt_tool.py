@@ -448,7 +448,11 @@ def _action_score(args: dict) -> str:
 
     try:
         # girth ability functions expect data as (n_items, n_people).
-        data_T = _to_girth(data.astype(float))
+        # NOTE (2026-10-26 fix): do NOT cast to float here — `data` is
+        # already int (see _prepare_for_girth), and girth's ability_eap
+        # indexes probability arrays with the response values, so float
+        # responses raise IndexError on EVERY input through this path.
+        data_T = _to_girth(data)
         use_3pl = (model == "3pl" and float(np.max(guess)) > 0)
         if use_3pl:
             # girth 0.8.0's ability_eap/mle/map take NO guessing parameter

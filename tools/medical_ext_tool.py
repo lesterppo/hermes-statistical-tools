@@ -357,6 +357,15 @@ def _meta_forest(args: dict) -> str:
         re = float(res.mean_effect_re)
         var_re = float(res.var_eff_w_re)
         tau2 = float(res.tau2)  # may be slightly negative (Q < df) — keep raw DL value
+        # NOTE (2026-10-26 fix): with tau2 < 0, statsmodels' combine_effects
+        # returns a NEGATIVE var_eff_w_re, and math.sqrt(var_re) below then
+        # raises "math domain error", killing the whole forest action. When
+        # tau2 <= 0 there is no between-study variance, so the random-effects
+        # estimate is the fixed-effect estimate — the same fallback the
+        # forest display weights (wre = w) and the Rust port already use.
+        if tau2 <= 0 or float(res.var_eff_w_re) <= 0:
+            re = float(res.mean_effect_fe)
+            var_re = float(res.var_eff_w_fe)
         Q = float(res.q)
         dfree = k - 1
         from scipy import stats as sps
@@ -380,7 +389,9 @@ def _meta_forest(args: dict) -> str:
         Qp = float(sps.chi2.sf(Q, dfree))
         denom = np.sum(w) - np.sum(w ** 2) / np.sum(w)
         tau2 = (Q - dfree) / denom if denom > 0 else 0.0  # raw DL; may be negative
-        wre = 1.0 / (vi + tau2)
+        # Same tau2 <= 0 fallback as the statsmodels path (see above): with
+        # negative tau2, 1/(vi+tau2) can go negative and corrupt re/var_re.
+        wre = 1.0 / (vi + tau2) if tau2 > 0 else w
         re = float(np.sum(wre * yi) / np.sum(wre))
         var_re = 1.0 / np.sum(wre)
         I2 = max(0.0, (Q - dfree) / Q) if Q > 0 else 0.0
@@ -513,9 +524,12 @@ def _power_prop(args: dict) -> str:
                             power=power, ratio=ratio, alternative="two-sided")
     except Exception as e:
         return _err(f"prop solve failed: {type(e).__name__}: {e}")
+    # NOTE (2026-10-26 fix): the original returned _f(power) here, i.e. the
+    # *input* power (None when solving for power), so solve-power returned
+    # power: null. Return the solved value like _power_ttest/_power_anova do.
     return _ok({"effect_size": _f(es),
                 "nobs1": _f(val) if nobs is None else _f(nobs),
-                "power": _f(power) if power is None else _f(power),
+                "power": _f(val) if power is None else _f(power),
                 "alpha": _f(alpha), "p1": _f(p1), "p2": _f(p2),
                 "ratio": _f(ratio)})
 

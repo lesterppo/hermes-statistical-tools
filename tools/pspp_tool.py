@@ -610,7 +610,12 @@ def _do_ks_test(cols: dict, args: dict) -> dict:
     elif v and v in cols:
         # One-sample KS (against normal)
         vals = _arr(cols[v])
-        D, p = scipy_stats.kstest(vals, 'norm', args=(np.mean(vals), np.std(vals, ddof=1)))
+        # NOTE (2026-10-26 fix): scipy 1.18.1's kstest with a distribution
+        # name + args= is broken (ndtr() takes 1-2 positional arguments but
+        # 3 were given). Pass a callable CDF instead — identical statistic
+        # and exact p-value, verified against the callable path.
+        _m, _s = float(np.mean(vals)), float(np.std(vals, ddof=1))
+        D, p = scipy_stats.kstest(vals, lambda q, m=_m, s=_s: norm.cdf(q, loc=m, scale=s))
         return {"D": _rnd(D), "p": _rnd(p), "type": "one-sample (vs normal)"}
     return {"e": "a+v+g for two-sample, or v for one-sample vs normal"}
 
